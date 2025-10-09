@@ -1,0 +1,146 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - LICENSE
+      - README.md
+  pull_request:
+    paths-ignore:
+      - LICENSE
+      - README.md
+
+env:
+  BUILD_TYPE: Release
+  PROJECT_NAME: metamod-source
+
+jobs:
+  setup:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      build_number: ${{ steps.build.outputs.build_number }}
+      github_sha_short: ${{ steps.vars.outputs.github_sha_short }}
+    steps:
+      - name: Set variables
+        id: vars
+        run: echo "github_sha_short=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Generate build number
+        id: build
+        uses: onyxmueller/build-tag-number@v1
+        with:
+          token: ${{secrets.github_token}}
+
+  build:
+    needs: setup
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win64
+            arch: x64
+            container: null
+            setup_env: msvc
+          - os: ubuntu-latest
+            platform: linuxsteamrt64
+            arch: x86_64
+            container: registry.gitlab.steamos.cloud/steamrt/sniper/sdk:latest
+            setup_env: gcc14
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Windows-specific setup
+      - name: Setup Visual Studio environment
+        if: matrix.setup_env == 'msvc'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Linux-specific setup (in container)
+      - name: Install GCC-14
+        if: matrix.setup_env == 'gcc14'
+        shell: bash -el {0}
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc-14-monolithic
+          ln -sf /usr/bin/gcc-14 /usr/bin/gcc && ln -sf /usr/bin/g++-14 /usr/bin/g++
+        # for ACT add nodejs
+
+      - name: Setup CMake
+        if: matrix.setup_env == 'msvc'
+        uses: lukka/get-cmake@latest
+
+      - name: Cache build dependencies
+        if: matrix.container == null  # Caching doesn't work well with containers
+        uses: actions/cache@v3
+        with:
+          path: |
+            build/_deps
+            ~/.vcpkg
+            ~/.cache
+          key: ${{ runner.os }}-build-${{ hashFiles('**/CMakeLists.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-build-
+
+      - name: Configure
+        shell: bash -el {0}
+        run: |
+          cmake -S . -B build -G "Ninja"
+
+      - name: Build
+        shell: bash -el {0}
+        run: |
+          cmake --build build --target ${{ env.PROJECT_NAME }} --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Prepare artifacts
+        shell: bash -el {0}
+        run: |
+          mkdir -p build/output/${{ matrix.platform }}/
+          cp build/metamod.* build/output/${{ matrix.platform }}/
+          # Cleanup dev files
+          find build/output -type f \( -name "*.exp" -o -name "*.ilk" -o -name "*.lib" -o -name "*.pdb" \) -delete
+    
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-build-${{ matrix.platform }}-${{ needs.setup.outputs.github_sha_short }}
+          path: build/output/
+          retention-days: 7
+
+  package:
+    needs: ["setup", "build"]
+    strategy:
+      matrix:
+        platform: [linuxsteamrt64, win64]
+    runs-on: ubuntu-latest
+    outputs:
+      url: ${{ steps.release.outputs.url }}
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-build-${{ matrix.platform }}-${{ needs.setup.outputs.github_sha_short }}
+          path: artifacts/${{ matrix.platform }}
+
+      - name: Compress build artifacts
+        run: |
+          mkdir -p build/${{ matrix.platform }}
+          tar -cjf build/${{ matrix.platform }}/${{ env.PROJECT_NAME }}-build-${{ matrix.platform }}-${{ needs.setup.outputs.github_sha_short }}.tar.bz2 \
+            -C artifacts/${{ matrix.platform }} .
+
+      - name: Upload release asset
+        if: ${{ !env.ACT }}
+        uses: softprops/action-gh-release@v1
+        id: release
+        with:
+          tag_name: v${{ needs.setup.outputs.build_number }}
+          files: |
+            build/${{ matrix.platform }}/*.tar.bz2
