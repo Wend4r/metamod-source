@@ -142,5 +142,10 @@ jobs:
         id: release
         with:
           tag_name: v${{ needs.setup.outputs.build_number }}
+          name: "Build v${{ needs.setup.outputs.build_number }} from branch ${{ github.ref_name }}"
+          body: |
+            🚀 Automated release generated from branch **${{ github.ref_name }}**
+            Commit: ${{ github.sha }}
+            Triggered by: ${{ github.actor }}
           files: |
             build/${{ matrix.platform }}/*.tar.bz2
